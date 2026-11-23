@@ -1,8 +1,7 @@
 # NextGCS SITL installer
 
 One-command installer for a local ArduPilot Copter simulator and the
-WebSocket bridge that [NextGCS](https://github.com/bradley10/nextgcs) uses.
-No repository clone is needed.
+WebSocket bridge that NextGCS uses. No repository clone is needed.
 
 The installer downloads the official ArduPilot SITL binary (about 7 MB),
 installs the single Node.js dependency it needs, writes a launcher, and can
