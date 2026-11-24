@@ -1,7 +1,8 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  One-command installer for the NextGCS local ArduPilot SITL simulator on Windows.
+  One-command installer for the NextGCS local ArduPilot SITL simulator on Windows,
+  or for a UDP-to-WebSocket bridge to a real drone.
 
 .DESCRIPTION
   ArduPilot SITL does not run natively on Windows. This script checks for WSL2
@@ -18,6 +19,18 @@
 
 .PARAMETER Yes
   Accept the installer defaults without asking questions.
+
+.PARAMETER Bridge
+  Bridge a real drone's MAVLink UDP to the NextGCS browser instead of
+  installing the simulator.
+
+.PARAMETER Udp
+  Vehicle or telemetry endpoint to send to, for example 192.168.1.50:14555.
+  Used with -Bridge.
+
+.PARAMETER UdpListen
+  UDP port to receive MAVLink on. Defaults to 14550 when no -Udp endpoint is
+  given. Used with -Bridge.
 
 .PARAMETER Vehicles
   Number of simulated drones: 1 or 2.
@@ -49,6 +62,12 @@
 
 .EXAMPLE
   .\install-sitl.ps1 -Yes -Vehicles 1 -Port 5765
+
+.EXAMPLE
+  .\install-sitl.ps1 -Bridge
+
+.EXAMPLE
+  .\install-sitl.ps1 -Bridge -Udp 192.168.1.50:14555
 #>
 [CmdletBinding()]
 param(
@@ -59,6 +78,9 @@ param(
   # are still distinguished with $PSBoundParameters below.
   [ValidateRange(1, 2)][int]$Vehicles = 1,
   [ValidateRange(1, 65535)][int]$Port = 5765,
+  [switch]$Bridge,
+  [string]$Udp,
+  [ValidateRange(0, 65535)][int]$UdpListen = 0,
   [switch]$NoStart,
   [switch]$Check,
   [string]$Dir,
@@ -119,9 +141,14 @@ function Invoke-Wsl([string[]]$Arguments) {
   return @{ Code = $code; Text = (($output | Out-String) -replace "`0", '').Trim() }
 }
 
-Write-Section 'NextGCS local SITL on Windows'
-Write-Step 'This sets up a simulated drone for NextGCS. It never touches a real aircraft.'
-Write-Step 'ArduPilot SITL runs inside WSL2, so this checks WSL2, Ubuntu, and Node.js first.'
+Write-Section 'NextGCS connection on Windows'
+if ($Bridge) {
+  Write-Step 'This bridges a real drone over UDP to the NextGCS browser.'
+  Write-Step 'It forwards MAVLink both ways, so commands sent in NextGCS reach the aircraft.'
+} else {
+  Write-Step 'This sets up a simulated drone for NextGCS. It never touches a real aircraft.'
+}
+Write-Step 'It runs inside WSL2, so this checks WSL2, Ubuntu, and Node.js first.'
 
 # --- WSL2 and Ubuntu ---------------------------------------------------------
 
@@ -328,6 +355,9 @@ try {
 
   $nodeArgs = @($linuxScript, '--wsl-distro', $WslDistro)
   if ($Yes) { $nodeArgs += '--yes' }
+  if ($Bridge) { $nodeArgs += '--bridge' }
+  if ($Udp) { $nodeArgs += @('--udp', $Udp) }
+  if ($UdpListen -gt 0) { $nodeArgs += @('--udp-listen', [string]$UdpListen) }
   if ($PSBoundParameters.ContainsKey('Vehicles')) { $nodeArgs += @('--vehicles', [string]$Vehicles) }
   if ($PSBoundParameters.ContainsKey('Port')) { $nodeArgs += @('--port', [string]$Port) }
   if ($NoStart) { $nodeArgs += '--no-start' }
@@ -341,9 +371,20 @@ try {
     $ipResult = Invoke-Wsl @('-d', $WslDistro, '--', 'hostname', '-I')
     $wslIp = ($ipResult.Text -split '\s+') | Where-Object { $_ } | Select-Object -First 1
 
-    Write-Step 'This downloads the official ArduPilot simulator (about 7 MB) and installs'
-    Write-Step 'one small Node package inside WSL. No repository clone is needed.'
-    Write-Step 'No administrator access is needed unless Node.js must be installed first.'
+    if ($Bridge) {
+      Write-Step 'The bridge waits for MAVLink UDP and serves it to NextGCS over WebSocket.'
+      Write-Step 'No simulator is downloaded; only the small Node package is installed once.'
+      if ($Udp) {
+        Write-Step "Sending to: $Udp"
+      } else {
+        $listenPort = if ($UdpListen -gt 0) { $UdpListen } else { 14550 }
+        Write-Step "Listening for drone MAVLink on UDP port $listenPort"
+      }
+    } else {
+      Write-Step 'This downloads the official ArduPilot simulator (about 7 MB) and installs'
+      Write-Step 'one small Node package inside WSL. No repository clone is needed.'
+      Write-Step 'No administrator access is needed unless Node.js must be installed first.'
+    }
     Write-Host ''
     Write-Host 'When it is running, connect NextGCS to:'
     Write-Host "  $WsUrl" -ForegroundColor Green
@@ -353,7 +394,11 @@ try {
       Write-Step 'If that does not connect, run "wsl hostname -I" and use that address.'
     }
     Write-Step 'Allow the Windows Firewall prompt for the WSL network if one appears.'
-    Write-Step 'Press Ctrl+C in this window to stop the simulator.'
+    if ($Bridge) {
+      Write-Step 'Press Ctrl+C in this window to stop the bridge.'
+    } else {
+      Write-Step 'Press Ctrl+C in this window to stop the simulator.'
+    }
     Write-Host ''
   }
 
@@ -368,7 +413,7 @@ try {
 
   # --- Persistent launcher for later one-command starts ----------------------
 
-  if (-not $Check) {
+  if (-not $Check -and -not $Bridge) {
     if ($linuxDir) {
       $linuxStart = "$linuxDir/start.sh"
     } else {

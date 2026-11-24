@@ -67,6 +67,45 @@ With two simulated drones, every line is tagged `v1` or `v2` so the two
 streams stay readable in one window. Nothing is written to a file; the
 simulator's own DataFlash logs remain in its state folder.
 
+## Real drone over UDP (browser bridge)
+
+The browser build of NextGCS cannot open UDP sockets. Run this same installer
+in bridge mode on the computer that receives the drone's telemetry; it serves
+MAVLink both ways over WebSocket, so NextGCS can connect with its normal
+WebSocket transport.
+
+macOS, Linux, or WSL2:
+
+```bash
+# Listen on UDP 14550 and reply to the first sender
+curl -fsSL https://raw.githubusercontent.com/bradley10/nextgcs-sitl/main/install-sitl.sh \
+  | bash -s -- --bridge
+
+# Or send to a known vehicle or telemetry endpoint
+curl -fsSL https://raw.githubusercontent.com/bradley10/nextgcs-sitl/main/install-sitl.sh \
+  | bash -s -- --bridge --udp 192.168.1.50:14555
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/bradley10/nextgcs-sitl/main/install-sitl.ps1 -OutFile install-sitl.ps1
+powershell -ExecutionPolicy Bypass -File .\install-sitl.ps1 -Bridge
+# or: .\install-sitl.ps1 -Bridge -Udp 192.168.1.50:14555
+```
+
+Then in NextGCS choose **Connect → WebSocket** and enter `ws://127.0.0.1:5765`.
+The connection dialog also builds this command from the address you type.
+Bridge mode does not download the simulator; it installs only the small `ws`
+package the first time, sends GCS heartbeats so the link becomes discoverable,
+prints live vehicle status messages, and forwards commands as well as telemetry —
+anything you send from NextGCS reaches the aircraft.
+
+Inside WSL the Windows browser reaches the bridge on `ws://127.0.0.1:5765`; if
+the UDP sender runs on Windows, point it at the WSL address the installer prints
+(or enable mirrored WSL networking). Using `--udp <host:port>` avoids that
+question: the bridge starts the conversation in the right direction.
+
 ## Requirements
 
 - Node.js 20 or newer. It also runs the WebSocket bridge.
@@ -117,6 +156,9 @@ Run the installer or launcher with `--help` for the full list.
 | `--check` | Check an existing installation and exit |
 | `--dir <path>` | Install folder (default `~/.nextgcs/sitl`) |
 | `--force` | Download and rebuild even if files already exist |
+| `--bridge` | Bridge a real drone's MAVLink UDP to WebSocket instead of running SITL |
+| `--udp <host:port>` | Bridge mode: send to this vehicle or telemetry endpoint |
+| `--udp-listen <port>` | Bridge mode: UDP port to receive on (default 14550) |
 
 ## What it installs
 

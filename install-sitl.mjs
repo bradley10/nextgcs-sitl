@@ -39,6 +39,7 @@ import {
   writeSync,
 } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
+import dgram from 'node:dgram';
 import { createRequire } from 'node:module';
 import net from 'node:net';
 import os from 'node:os';
@@ -118,6 +119,17 @@ Options:
   --base-url <url>      Base URL shown in instructions
   -h, --help            Show this message
 
+Bridge mode (connects a real drone instead of running a simulator):
+  --bridge              Serve a real drone's MAVLink UDP to the browser
+  --udp <host:port>     Send to this drone or telemetry endpoint
+  --udp-listen <port>   UDP port to receive MAVLink on (default: ${DEFAULT_UDP_PORT})
+
+Bridge mode does not download or start ArduPilot. It serves MAVLink both
+ways, so commands you send in NextGCS reach the aircraft.
+
+  curl -fsSL ${base}/install-sitl.sh | bash -s -- --bridge
+  curl -fsSL ${base}/install-sitl.sh | bash -s -- --bridge --udp 192.168.1.50:14555
+
 After installing, start later with:
   ~/.nextgcs/sitl/start.sh          (Linux, macOS, WSL2)
 
@@ -136,6 +148,19 @@ function parsePort(raw, flag) {
   return num;
 }
 
+function parseUdpTarget(raw) {
+  const text = String(raw ?? '').trim();
+  const separator = text.lastIndexOf(':');
+  const address = separator > 0 ? text.slice(0, separator).replace(/^\[|\]$/g, '') : '';
+  const port = separator > 0 ? Number(text.slice(separator + 1)) : 0;
+  if (!address || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new InstallError(
+      `--udp needs host:port, for example --udp 192.168.1.50:14555 (got "${raw}").`
+    );
+  }
+  return { address, port };
+}
+
 function parseArgs(argv) {
   const opts = {
     yes: false,
@@ -150,6 +175,9 @@ function parseArgs(argv) {
     host: null,
     wslDistro: process.env.NEXTGCS_WSL_DISTRO || process.env.WSL_DISTRO_NAME || null,
     baseUrl: DEFAULT_BASE_URL,
+    bridge: false,
+    udp: null,
+    udpListen: null,
     help: false,
   };
 
@@ -204,6 +232,16 @@ function parseArgs(argv) {
         throw new InstallError('--base-url needs a URL.');
       }
       opts.baseUrl = url;
+    } else if (arg === '--bridge') {
+      opts.bridge = true;
+    } else if (arg === '--udp') {
+      const value = argv[++i];
+      if (!value || value.startsWith('--')) {
+        throw new InstallError('--udp needs host:port, for example --udp 192.168.1.50:14555.');
+      }
+      opts.udp = value;
+    } else if (arg === '--udp-listen') {
+      opts.udpListen = parsePort(argv[++i], arg);
     } else {
       throw new InstallError(`Unknown option: ${arg}`, [
         'Run "node install-sitl.mjs --help" to see the options.',
@@ -530,7 +568,10 @@ export function createStatustextRelay(onMessage) {
           const end = text.indexOf('\u0000');
           if (end >= 0) text = text.slice(0, end);
           text = text.trim();
-          if (text) onMessage(severity, text);
+          if (text) {
+            const sourceSysId = magic === 0xfd ? buffer[offset + 5] : buffer[offset + 3];
+            onMessage(severity, text, sourceSysId);
+          }
         }
 
         offset += frameLength;
@@ -543,6 +584,234 @@ export function createStatustextRelay(onMessage) {
 
 export function severityLabel(severity) {
   return MAVLINK_SEVERITIES[severity] ?? `SEV${severity}`;
+}
+
+function mavlinkChecksum(bytes, crcExtra) {
+  let crc = 0xffff;
+  const accumulate = (byte) => {
+    let tmp = byte ^ (crc & 0xff);
+    tmp ^= (tmp << 4) & 0xff;
+    crc = ((crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)) & 0xffff;
+  };
+  for (const byte of bytes) accumulate(byte);
+  accumulate(crcExtra);
+  return crc;
+}
+
+/**
+ * A minimal MAVLink 2 GCS heartbeat (HEARTBEAT, message id 0). ArduPilot needs
+ * to hear from a GCS before it streams to a UDP endpoint and so the link stays
+ * discoverable. Matches the byte layout of the generated codec.
+ */
+export function encodeGcsHeartbeat(seq = 0) {
+  const payload = Buffer.alloc(9);
+  payload[4] = 6; // MAV_TYPE_GCS
+  payload[5] = 8; // MAV_AUTOPILOT_INVALID
+  payload[6] = 0; // base_mode
+  payload[7] = 4; // MAV_STATE_ACTIVE
+  payload[8] = 3; // mavlink_version
+  const header = Buffer.from([0xfd, payload.length, 0, 0, seq & 0xff, 255, 190, 0, 0, 0]);
+  const checksum = mavlinkChecksum(Buffer.concat([header.subarray(1), payload]), 50);
+  const trailer = Buffer.alloc(2);
+  trailer.writeUInt16LE(checksum, 0);
+  return Buffer.concat([header, payload, trailer]);
+}
+
+/**
+ * Bridge a real drone's MAVLink UDP stream to a WebSocket for the browser.
+ * Traffic is forwarded both ways: UDP packets go to every open WebSocket
+ * client, and client frames go back to the vehicle endpoint. In listen mode
+ * the endpoint is learned from the first packet (and followed if it moves);
+ * with udpTarget set, heartbeats start immediately and replies are accepted
+ * on the same socket.
+ */
+export async function startUdpBridge(options = {}) {
+  const wsLib = options.wsLib ?? loadWs(options.root);
+  const log = options.log ?? console.log;
+  const logError = options.logError ?? console.error;
+  const requestedWsPort = options.wsPort ?? DEFAULT_PORT;
+  const wsHost = options.wsHost ?? '127.0.0.1';
+  const heartbeatMs = options.heartbeatMs ?? 1000;
+  const target = options.udpTarget ?? null;
+  const listenPort = options.udpListenPort ?? (target ? 0 : DEFAULT_UDP_PORT);
+
+  const socket = dgram.createSocket('udp4');
+  await new Promise((resolve, reject) => {
+    const onListening = () => {
+      socket.removeListener('error', onError);
+      resolve();
+    };
+    const onError = (error) => {
+      socket.removeListener('listening', onListening);
+      reject(
+        error.code === 'EADDRINUSE'
+          ? new InstallError(`UDP port ${listenPort || 'chosen'} is already in use.`, [
+              'Stop the other program, or choose a different port with --udp-listen.',
+              'If a simulator is already running, stop it first.',
+            ])
+          : error
+      );
+    };
+    socket.once('listening', onListening);
+    socket.once('error', onError);
+    socket.bind({ address: '0.0.0.0', port: listenPort });
+  });
+
+  const boundPort = socket.address().port;
+  let peer = target ? { ...target } : null;
+  let heartbeatSeq = 0;
+  let warnedNoPeer = false;
+  let wss = null;
+  let closed = false;
+
+  const sendHeartbeat = () => {
+    if (!peer) return;
+    socket.send(encodeGcsHeartbeat(heartbeatSeq++), peer.port, peer.address, (error) => {
+      if (error) logError(`${timestamp()} [bridge] UDP send failed: ${error.message}`);
+    });
+  };
+
+  const notePeer = (rinfo) => {
+    if (target) return;
+    if (peer && peer.address === rinfo.address && peer.port === rinfo.port) return;
+    const moved = Boolean(peer);
+    peer = { address: rinfo.address, port: rinfo.port };
+    log(
+      `${timestamp()} [bridge] ${moved ? 'vehicle endpoint moved to' : 'vehicle endpoint'} ${
+        peer.address
+      }:${peer.port}`
+    );
+    sendHeartbeat();
+  };
+
+  const statusText = createStatustextRelay((severity, text, sysId) => {
+    log(`${timestamp()} [drone ${sysId}] ${severityLabel(severity)}: ${text}`);
+  });
+
+  const broadcast = (bytes) => {
+    if (!wss) return;
+    for (const client of wss.clients) {
+      if (client.readyState === wsLib.WebSocket.OPEN) client.send(bytes);
+    }
+  };
+
+  socket.on('message', (message, rinfo) => {
+    notePeer(rinfo);
+    statusText.push(message);
+    broadcast(message);
+  });
+  socket.on('error', (error) => {
+    logError(`${timestamp()} [bridge] UDP error: ${error.message}`);
+  });
+
+  const heartbeat = setInterval(sendHeartbeat, heartbeatMs);
+
+  try {
+    wss = new wsLib.WebSocketServer({ host: wsHost, port: requestedWsPort });
+    await new Promise((resolve, reject) => {
+      const onListening = () => {
+        wss.removeListener('error', onError);
+        resolve();
+      };
+      const onError = (error) => {
+        wss.removeListener('listening', onListening);
+        reject(
+          error.code === 'EADDRINUSE'
+            ? new InstallError(`WebSocket port ${requestedWsPort} is already in use.`, [
+                'Stop the other program, or choose a different port with --port.',
+              ])
+            : error
+        );
+      };
+      wss.once('listening', onListening);
+      wss.once('error', onError);
+    });
+  } catch (error) {
+    clearInterval(heartbeat);
+    socket.close();
+    throw error;
+  }
+
+  const actualWsPort = wss.address()?.port ?? requestedWsPort;
+
+  wss.on('error', (error) => {
+    logError(`${timestamp()} [ws] server error: ${error.message}`);
+  });
+
+  wss.on('connection', (ws) => {
+    log(`${timestamp()} [ws] connection opened (${wss.clients.size} open)`);
+    ws.on('close', () => {
+      log(`${timestamp()} [ws] connection closed (${wss.clients.size} open)`);
+    });
+    ws.on('error', () => {
+      // ignore abrupt client disconnects
+    });
+    ws.on('message', (data) => {
+      if (!peer) {
+        if (!warnedNoPeer) {
+          warnedNoPeer = true;
+          log(
+            `${timestamp()} [bridge] waiting for the first UDP packet to learn the vehicle address`
+          );
+        }
+        return;
+      }
+      const bytes = Buffer.isBuffer(data)
+        ? data
+        : Array.isArray(data)
+          ? Buffer.concat(data)
+          : Buffer.from(data);
+      socket.send(bytes, peer.port, peer.address, (error) => {
+        if (error) logError(`${timestamp()} [bridge] UDP send failed: ${error.message}`);
+      });
+    });
+  });
+
+  if (peer) sendHeartbeat();
+
+  const displayHost = wsHost === '0.0.0.0' || wsHost === '::' ? localIpv4() : wsHost;
+  log('');
+  log(`${timestamp()} [bridge] listening for MAVLink UDP on 0.0.0.0:${boundPort}`);
+  if (target) log(`${timestamp()} [bridge] sending to ${target.address}:${target.port}`);
+  log('');
+  log('Connect NextGCS to:');
+  log(`  ws://127.0.0.1:${actualWsPort}`);
+  if (wsHost === '0.0.0.0' || wsHost === '::') {
+    log('');
+    log('On Windows, try 127.0.0.1 first.');
+    if (displayHost) log(`If that does not connect, use: ws://${displayHost}:${actualWsPort}`);
+  }
+  log('');
+  log('This bridges MAVLink both ways; commands from NextGCS reach the aircraft.');
+  log('Keep this window open. Press Ctrl+C to stop.');
+
+  return {
+    wsPort: actualWsPort,
+    udpPort: boundPort,
+    get peer() {
+      return peer;
+    },
+    close() {
+      if (closed) return Promise.resolve();
+      closed = true;
+      clearInterval(heartbeat);
+      return new Promise((resolve) => {
+        const closeSocket = () => socket.close(() => resolve());
+        if (!wss) {
+          closeSocket();
+          return;
+        }
+        for (const client of wss.clients) {
+          try {
+            client.terminate();
+          } catch {
+            // already gone
+          }
+        }
+        wss.close(closeSocket);
+      });
+    },
+  };
 }
 
 function armInactivityTimer(timerRef, controller, ms) {
@@ -1642,6 +1911,32 @@ function toPowerShellArgs(argv) {
   return out;
 }
 
+async function startBridgeMode(opts) {
+  const root = opts.dir || defaultInstallDir();
+  mkdirSync(root, { recursive: true });
+  ensureWsDependency(root, { force: false });
+  const wsLib = loadWs(root);
+  const wsHost = opts.host || (isWsl() ? '0.0.0.0' : '127.0.0.1');
+  const udpTarget = opts.udp ? parseUdpTarget(opts.udp) : null;
+  const udpListenPort = opts.udpListen ?? (udpTarget ? 0 : DEFAULT_UDP_PORT);
+
+  console.log('');
+  console.log('NextGCS MAVLink bridge');
+  console.log('----------------------');
+  console.log("This serves a real drone's MAVLink UDP to the NextGCS browser.");
+  console.log('It does not start a simulator.');
+  console.log('');
+
+  await startUdpBridge({
+    root,
+    wsPort: opts.port,
+    wsHost,
+    udpTarget,
+    udpListenPort,
+    wsLib,
+  });
+}
+
 async function main() {
   const nodeMajor = Number(process.versions.node.split('.')[0]);
   if (!Number.isFinite(nodeMajor) || nodeMajor < MIN_NODE_MAJOR) {
@@ -1654,6 +1949,11 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) {
     printHelp();
+    return;
+  }
+
+  if (opts.bridge) {
+    await startBridgeMode(opts);
     return;
   }
 
