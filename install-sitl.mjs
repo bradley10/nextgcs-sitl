@@ -1628,7 +1628,7 @@ async function main() {
       optionItems.push({
         key: 'vehicles',
         checked: false,
-        label: 'Two simulated drones (leave empty for one)',
+        label: 'Simulate two drones instead of one',
       });
     }
     if (wipe === null) {
