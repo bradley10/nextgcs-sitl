@@ -125,7 +125,9 @@ Bridge mode (connects a real drone instead of running a simulator):
   --udp-listen <port>   UDP port to receive MAVLink on (default: ${DEFAULT_UDP_PORT})
 
 Bridge mode does not download or start ArduPilot. It serves MAVLink both
-ways, so commands you send in NextGCS reach the aircraft.
+ways, so commands you send in NextGCS reach the aircraft. On Windows, the
+PowerShell bootstrap runs the bridge with Windows Node.js when it is
+installed, otherwise it runs inside WSL2.
 
   curl -fsSL ${base}/install-sitl.sh | bash -s -- --bridge
   curl -fsSL ${base}/install-sitl.sh | bash -s -- --bridge --udp 192.168.1.50:14555
@@ -1136,11 +1138,43 @@ function assertDockerReady() {
       'Start Docker Desktop, then run the installer again.',
     ]);
   }
-  if (!commandWorks('docker', ['info', '--format', '{{.ServerVersion}}'], 30000)) {
-    throw new InstallError('Docker is installed, but its engine is not running.', [
-      'Start Docker Desktop and wait until it says "Engine running".',
-      'Then run the installer again.',
-    ]);
+  const info = spawnSync('docker', ['info', '--format', '{{.ServerVersion}}'], {
+    encoding: 'utf8',
+    timeout: 30000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (info.status !== 0) {
+    const detail = `${info.stderr || ''}`.trim();
+    const denied = /permission denied|access is denied/i.test(detail);
+    throw new InstallError(
+      denied
+        ? 'Docker is installed, but this user cannot access its engine.'
+        : 'Docker is installed, but its engine is not running.',
+      [
+        ...(denied
+          ? [
+              'Add your user to the docker group: sudo usermod -aG docker $USER',
+              'Log out and back in (or run "newgrp docker" in a new terminal), then retry.',
+            ]
+          : [
+              'Start Docker Desktop and wait until it says "Engine running".',
+              'Then run the installer again.',
+            ]),
+        ...(detail ? [detail] : []),
+      ]
+    );
+  }
+  if (process.platform === 'linux' && process.arch !== 'x64') {
+    const qemuReady = existsSync('/proc/sys/fs/binfmt_misc/qemu-x86_64') ||
+      existsSync('/proc/sys/fs/binfmt_misc/qemu-amd64');
+    if (!qemuReady) {
+      console.log(
+        '  Note: this is an ARM Linux computer. The simulator runs as an amd64 container,'
+      );
+      console.log(
+        '  so enable qemu binfmt emulation (for example: sudo apt-get install -y qemu-user-static).'
+      );
+    }
   }
 }
 

@@ -22,7 +22,8 @@
 
 .PARAMETER Bridge
   Bridge a real drone's MAVLink UDP to the NextGCS browser instead of
-  installing the simulator.
+  installing the simulator. Runs natively when Node.js 20+ is installed on
+  Windows; otherwise it runs the bridge inside WSL2.
 
 .PARAMETER Udp
   Vehicle or telemetry endpoint to send to, for example 192.168.1.50:14555.
@@ -139,6 +140,87 @@ function Invoke-Wsl([string[]]$Arguments) {
   $output = & wsl.exe @Arguments 2>$null
   $code = $LASTEXITCODE
   return @{ Code = $code; Text = (($output | Out-String) -replace "`0", '').Trim() }
+}
+
+function Save-RemoteInstaller([string]$Target) {
+  $headers = @{ 'User-Agent' = 'NextGCS-SITL-Installer/1.0' }
+  $githubToken = $env:GITHUB_TOKEN
+  if (-not $githubToken -and (Test-Command 'gh')) {
+    try {
+      $githubToken = (& gh auth token 2>$null | Select-Object -First 1)
+      if ($githubToken) { $githubToken = $githubToken.Trim() }
+    } catch {
+      $githubToken = $null
+    }
+  }
+  if ($githubToken) { $headers['Authorization'] = "Bearer $githubToken" }
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  Invoke-WebRequest -Uri $InstallerUrl -OutFile $Target -Headers $headers `
+    -UseBasicParsing -TimeoutSec 180 -ErrorAction Stop
+}
+
+# --- Bridge on native Windows Node.js ---------------------------------------
+#
+# Running the bridge on Windows itself is the reliable option when the drone's
+# telemetry source is another Windows program: WSL2 does not forward UDP
+# localhost traffic from Windows into the distribution by default. Use the
+# native path whenever Node.js 20+ is already installed on Windows; otherwise
+# fall through to the WSL route below.
+$nativeNodeMajor = $null
+$nativeNode = Get-Command node -ErrorAction SilentlyContinue
+# Skip the Microsoft Store app-execution stub; running it opens the Store.
+if ($nativeNode -and $nativeNode.Source -notmatch '\\WindowsApps\\') {
+  try {
+    $nativeVersion = (& node -p 'process.versions.node' 2>$null | Select-Object -First 1)
+    if ($nativeVersion -and ($nativeVersion -match '^(\d+)\.')) {
+      $nativeNodeMajor = [int]$Matches[1]
+    }
+  } catch {
+    $nativeNodeMajor = $null
+  }
+}
+
+if ($Bridge -and $null -ne $nativeNodeMajor -and $nativeNodeMajor -ge 20) {
+  Write-Section 'NextGCS MAVLink bridge on Windows'
+  Write-Step 'Node.js 20+ found on Windows, so the bridge runs natively (no WSL).'
+  Write-Step 'It forwards MAVLink both ways; commands sent in NextGCS reach the aircraft.'
+  $TempFile = Join-Path $env:TEMP "nextgcs-install-sitl-$PID.mjs"
+  try {
+    Write-Step "Downloading the bridge from $InstallerUrl"
+    try {
+      Save-RemoteInstaller $TempFile
+    } catch {
+      Stop-WithHelp 'Could not download install-sitl.mjs.' @(
+        'Check the internet connection and try again.',
+        "URL: $InstallerUrl",
+        'For a private GitHub repository, set GITHUB_TOKEN to a token that can read it.',
+        $_.Exception.Message
+      )
+    }
+    $fileInfo = Get-Item $TempFile -ErrorAction SilentlyContinue
+    if (-not $fileInfo -or $fileInfo.Length -lt 1000) {
+      Stop-WithHelp 'The downloaded installer is empty or incomplete.' @(
+        'Check the internet connection and try again.',
+        "URL: $InstallerUrl"
+      )
+    }
+    $bridgeArgs = @($TempFile, '--bridge', '--port', [string]$Port)
+    if ($Udp) { $bridgeArgs += @('--udp', $Udp) }
+    if ($UdpListen -gt 0) { $bridgeArgs += @('--udp-listen', [string]$UdpListen) }
+    if ($Dir) { $bridgeArgs += @('--dir', $Dir) }
+    Write-Step 'Allow the Windows Firewall prompt if one appears.'
+    Write-Step 'Keep this window open. Press Ctrl+C to stop the bridge.'
+    Write-Host ''
+    & node @bridgeArgs
+    exit $LASTEXITCODE
+  } finally {
+    if (Test-Path $TempFile) { Remove-Item $TempFile -Force -ErrorAction SilentlyContinue }
+  }
+}
+
+if ($Bridge -and $null -ne $nativeNodeMajor -and $nativeNodeMajor -lt 20) {
+  Write-Step "Node.js $nativeNodeMajor on Windows is too old for a native bridge; using WSL instead."
+  Write-Step 'Install Node.js 20 or newer for Windows to run the bridge without WSL.'
 }
 
 Write-Section 'NextGCS connection on Windows'
@@ -379,6 +461,8 @@ try {
       } else {
         $listenPort = if ($UdpListen -gt 0) { $UdpListen } else { 14550 }
         Write-Step "Listening for drone MAVLink on UDP port $listenPort"
+        Write-Step 'If the telemetry sender runs on Windows, point it at the WSL address below,'
+        Write-Step 'or install Node.js 20+ for Windows and rerun -Bridge to run it natively.'
       }
     } else {
       Write-Step 'This downloads the official ArduPilot simulator (about 7 MB) and installs'

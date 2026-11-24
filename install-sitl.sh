@@ -38,6 +38,27 @@ fail() {
 
 # Node.js 20+ is required. Node also runs the WebSocket bridge, so it is not
 # optional. Never try to install it silently; print the smallest useful steps.
+#
+# Non-interactive shells do not load nvm or every package-manager path, so a
+# Node that works in the user's terminal can still be invisible to "curl |
+# bash". Add the common install locations and source nvm before giving up.
+if ! command -v node >/dev/null 2>&1; then
+  for node_dir in /opt/homebrew/bin /usr/local/bin "$HOME/.volta/bin" "$HOME/.local/bin" "$HOME/.asdf/shims"; do
+    if [ -d "$node_dir" ]; then
+      case ":$PATH:" in
+        *":$node_dir:"*) ;;
+        *) PATH="$node_dir:$PATH" ;;
+      esac
+    fi
+  done
+  for nvm_sh in "${NVM_DIR:-$HOME/.nvm}/nvm.sh" /usr/local/opt/nvm/nvm.sh /opt/homebrew/opt/nvm/nvm.sh; do
+    if [ -s "$nvm_sh" ] && . "$nvm_sh" >/dev/null 2>&1; then
+      break
+    fi
+  done
+  export PATH
+fi
+
 if ! command -v node >/dev/null 2>&1; then
   fail "Node.js is not installed or not on PATH." \
     "Install Node.js 20 or newer from https://nodejs.org/ (it includes npm)." \

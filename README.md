@@ -106,15 +106,24 @@ the UDP sender runs on Windows, point it at the WSL address the installer prints
 (or enable mirrored WSL networking). Using `--udp <host:port>` avoids that
 question: the bridge starts the conversation in the right direction.
 
+When Node.js 20 or newer is installed on Windows, `-Bridge` runs natively on
+Windows instead of WSL. That is the reliable choice when the drone's telemetry
+sender is another Windows program, because WSL2 does not forward UDP localhost
+traffic into the distribution by default. If Windows Node.js is missing, the
+bridge falls back to WSL2 and the installer prints the WSL address to use.
+
 ## Requirements
 
-- Node.js 20 or newer. It also runs the WebSocket bridge.
-- Linux x86_64 runs the simulator natively.
+- Node.js 20 or newer. It also runs the WebSocket bridge and is required
+  everywhere (inside WSL2 on Windows). A separate Windows Node.js is optional
+  but recommended for a native bridge.
+- Linux x86_64 runs the simulator natively. Other Linux architectures use
+  Docker and need amd64 emulation (qemu binfmt).
 - macOS and non-x86_64 Linux use Docker. Start Docker Desktop first. On Apple
   Silicon, enable Rosetta for x86_64/amd64 emulation.
 - Windows needs Windows 10 2004+ or Windows 11 with WSL2 and an Ubuntu
-  distribution. The PowerShell installer checks WSL2 and Node.js inside WSL
-  and prints the exact setup command if anything is missing.
+  distribution for the simulator. The PowerShell installer checks WSL2 and
+  Node.js inside WSL and prints the exact setup command if anything is missing.
 
 The installer does not need Administrator or sudo. Installing Node.js, Docker,
 or WSL2 may require it, depending on your computer.
