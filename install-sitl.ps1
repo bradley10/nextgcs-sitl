@@ -53,8 +53,12 @@
 [CmdletBinding()]
 param(
   [switch]$Yes,
-  [ValidateRange(1, 2)][int]$Vehicles,
-  [ValidateRange(1, 65535)][int]$Port,
+  # These need in-range defaults. "irm ... | iex" invokes the script block with
+  # no arguments, and an [int] parameter with no default starts at 0, which
+  # ValidateRange rejects before the script body runs. Explicitly passed values
+  # are still distinguished with $PSBoundParameters below.
+  [ValidateRange(1, 2)][int]$Vehicles = 1,
+  [ValidateRange(1, 65535)][int]$Port = 5765,
   [switch]$NoStart,
   [switch]$Check,
   [string]$Dir,
@@ -66,6 +70,11 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# "irm ... | iex" runs this file as a script block inside the caller's session,
+# where exit would close the user's PowerShell window. Report failures by
+# throwing in that case; runs from a .ps1 file keep their real exit codes.
+$RunningFromIex = -not $MyInvocation.PSCommandPath
+
 $DefaultBaseUrl = 'https://raw.githubusercontent.com/bradley10/nextgcs-sitl/main'
 if (-not $BaseUrl) {
   if ($env:NEXTGCS_INSTALL_BASE_URL) { $BaseUrl = $env:NEXTGCS_INSTALL_BASE_URL }
@@ -73,7 +82,7 @@ if (-not $BaseUrl) {
 }
 $BaseUrl = $BaseUrl.TrimEnd('/')
 $InstallerUrl = "$BaseUrl/install-sitl.mjs"
-$WsUrl = 'ws://127.0.0.1:5765'
+$WsUrl = "ws://127.0.0.1:$Port"
 $ExitCode = 0
 $TempFile = $null
 
@@ -96,6 +105,7 @@ function Stop-WithHelp([string]$Message, [string[]]$Hints) {
     foreach ($hint in $Hints) { Write-Host "  - $hint" }
   }
   Write-Host ''
+  if ($RunningFromIex) { throw $Message }
   exit 1
 }
 
@@ -351,11 +361,9 @@ try {
   $ExitCode = $LASTEXITCODE
 
   if ($ExitCode -ne 0) {
-    Write-Host ''
-    Write-Host "The installer exited with code $ExitCode." -ForegroundColor Red
-    Write-Host 'Run it again to see the specific message, or use -Check to inspect the install.'
-    Write-Host ''
-    exit $ExitCode
+    Stop-WithHelp "the installer exited with code $ExitCode." @(
+      'Run it again to see the specific message, or use -Check to inspect the install.'
+    )
   }
 
   # --- Persistent launcher for later one-command starts ----------------------
@@ -400,4 +408,4 @@ try {
   }
 }
 
-exit $ExitCode
+if (-not $RunningFromIex) { exit $ExitCode }

@@ -27,11 +27,11 @@ import {
   chmodSync,
   closeSync,
   copyFileSync,
-  createReadStream,
   existsSync,
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   unlinkSync,
@@ -44,6 +44,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline/promises';
+import { ReadStream as TtyReadStream } from 'node:tty';
 import { fileURLToPath } from 'node:url';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -91,8 +92,12 @@ Usually you do not run this file directly. Use one command:
   Windows PowerShell:
     irm ${base}/install-sitl.ps1 | iex
 
+A run with a terminal shows one checklist (defaults already ticked); press
+Enter to accept them. Use --yes to skip it and other options to set values
+up front.
+
 Options:
-  -y, --yes             Accept the defaults without asking
+  -y, --yes             Skip the checklist and use the defaults
   --vehicles <1|2>      Simulated drones to start (default: 1)
   --port <port>         WebSocket port for the first drone (default: ${DEFAULT_PORT})
   --wipe                Reset simulator state on every start (default)
@@ -268,49 +273,158 @@ function localIpv4() {
   return preferred[0] || null;
 }
 
+/**
+ * One-screen checklist that replaces a string of [Y/n] questions. Up/Down (or
+ * j/k) move, Space toggles, Enter accepts the current choices, Ctrl+C cancels.
+ * The list is redrawn in place, so the user sees one compact set of checkboxes
+ * with the good defaults already ticked.
+ */
+export function chooseOptions(stream, output, items) {
+  if (items.length === 0) return Promise.resolve({});
+  const wasRaw = Boolean(stream.isRaw);
+  stream.setRawMode(true);
+  stream.resume();
+
+  return new Promise((resolve) => {
+    let cursor = 0;
+    let renderedLines = 0;
+    let settled = false;
+
+    const draw = () => {
+      if (renderedLines > 0) output.write(`\x1b[${renderedLines}A`);
+      const lines = [
+        'Press Enter to accept these options:',
+        ...items.map(
+          (item, index) =>
+            `  ${index === cursor ? '>' : ' '} [${item.checked ? 'x' : ' '}] ${item.label}`
+        ),
+        '  ↑/↓ move · Space toggle · Enter accept · Ctrl+C cancel',
+      ];
+      for (const line of lines) output.write(`\x1b[2K${line}\n`);
+      renderedLines = lines.length;
+    };
+
+    const finish = () => {
+      stream.removeListener('data', onData);
+      try {
+        stream.setRawMode(wasRaw);
+      } catch {
+        // stream already closed
+      }
+      stream.pause();
+    };
+
+    const accept = () => {
+      if (settled) return;
+      settled = true;
+      finish();
+      const chosen = {};
+      for (const item of items) chosen[item.key] = item.checked;
+      resolve(chosen);
+    };
+
+    const cancel = () => {
+      if (settled) return;
+      settled = true;
+      finish();
+      output.write('\n');
+      process.exit(130);
+    };
+
+    const move = (delta) => {
+      cursor = (cursor + delta + items.length) % items.length;
+      draw();
+    };
+
+    const toggle = () => {
+      items[cursor].checked = !items[cursor].checked;
+      draw();
+    };
+
+    const onData = (chunk) => {
+      const text = chunk.toString('utf8');
+      for (let i = 0; i < text.length; i += 1) {
+        const ch = text[i];
+        if (ch === '\x1b') {
+          const rest = text.slice(i + 1);
+          if (rest.startsWith('[A') || rest.startsWith('OA')) {
+            move(-1);
+            i += 2;
+          } else if (rest.startsWith('[B') || rest.startsWith('OB')) {
+            move(1);
+            i += 2;
+          } else {
+            i = text.length;
+          }
+          continue;
+        }
+        if (ch === '\r' || ch === '\n') {
+          accept();
+          return;
+        }
+        if (ch === '\x03') {
+          cancel();
+          return;
+        }
+        if (ch === ' ') {
+          toggle();
+          continue;
+        }
+        if (ch === 'k') move(-1);
+        else if (ch === 'j') move(1);
+      }
+    };
+
+    stream.on('data', onData);
+    draw();
+  });
+}
+
+function makePrompter(stream, openedFd) {
+  let rl = null;
+  const reader = () => {
+    if (!rl) {
+      rl = readline.createInterface({ input: stream, output: process.stdout, terminal: true });
+    }
+    return rl;
+  };
+
+  return {
+    canChooseOptions: typeof stream.setRawMode === 'function',
+    chooseOptions(items) {
+      return chooseOptions(stream, process.stdout, items);
+    },
+    async ask(question, fallback) {
+      const answer = (await reader().question(question)).trim();
+      return answer === '' ? fallback : answer;
+    },
+    async confirm(question, fallback) {
+      const answer = (await reader().question(question)).trim().toLowerCase();
+      if (answer === '') return fallback;
+      return answer.startsWith('y');
+    },
+    close() {
+      if (rl) rl.close();
+      if (openedFd !== null) {
+        try {
+          closeSync(openedFd);
+        } catch {
+          // already closed
+        }
+      }
+    },
+  };
+}
+
 async function createPrompter() {
   if (process.stdin.isTTY) {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    return {
-      async ask(question, fallback) {
-        const answer = (await rl.question(question)).trim();
-        return answer === '' ? fallback : answer;
-      },
-      async confirm(question, fallback) {
-        const answer = (await rl.question(question)).trim().toLowerCase();
-        if (answer === '') return fallback;
-        return answer.startsWith('y');
-      },
-      close() {
-        rl.close();
-      },
-    };
+    return makePrompter(process.stdin, null);
   }
 
   if (process.platform !== 'win32') {
     try {
       const fd = openSync('/dev/tty', 'r');
-      const input = createReadStream(null, { fd, autoClose: false });
-      const rl = readline.createInterface({ input, output: process.stdout });
-      return {
-        async ask(question, fallback) {
-          const answer = (await rl.question(question)).trim();
-          return answer === '' ? fallback : answer;
-        },
-        async confirm(question, fallback) {
-          const answer = (await rl.question(question)).trim().toLowerCase();
-          if (answer === '') return fallback;
-          return answer.startsWith('y');
-        },
-        close() {
-          rl.close();
-          try {
-            closeSync(fd);
-          } catch {
-            // best effort
-          }
-        },
-      };
+      return makePrompter(new TtyReadStream(fd), fd);
     } catch {
       // No controlling terminal (for example a scheduled task). Fall back to
       // unattended defaults rather than hanging forever.
@@ -1505,54 +1619,97 @@ async function main() {
 
   let shouldDownload = !installed;
   try {
-    if (installed) {
-      if (prompter) {
-        const reuse = await prompter.confirm(
-          'A simulator is already installed here. Verify and reuse it? [Y/n] ',
-          true
-        );
-        shouldDownload = !reuse;
-      } else if (!opts.yes) {
-        console.log('Existing simulator found; it will be verified and reused.');
-      }
-    } else if (prompter) {
-      const proceed = await prompter.confirm('Download and set up the simulator now? [Y/n] ', true);
-      if (!proceed) {
-        console.log('');
-        console.log('Cancelled. Nothing was changed.');
-        prompter.close();
-        return;
-      }
-    }
-
     let vehicles = opts.vehicles;
+    let wipe = opts.wipe;
+    let startNow = !opts.noStart;
+
+    const optionItems = [];
     if (vehicles === null) {
-      if (prompter) {
-        const answer = await prompter.ask(
-          'How many simulated drones? Enter 1 or 2 [1]: ',
-          '1'
-        );
-        vehicles = answer === '2' ? 2 : 1;
-      } else {
-        vehicles = 1;
-      }
+      optionItems.push({
+        key: 'vehicles',
+        checked: false,
+        label: 'Two simulated drones (leave empty for one)',
+      });
+    }
+    if (wipe === null) {
+      optionItems.push({
+        key: 'wipe',
+        checked: true,
+        label: 'Reset the simulated drone on every start (always fresh)',
+      });
+    }
+    if (!opts.noStart) {
+      optionItems.push({
+        key: 'start',
+        checked: true,
+        label: 'Start the simulator when setup finishes',
+      });
     }
 
-    let wipe = opts.wipe;
-    if (wipe === null) {
-      if (prompter) {
-        wipe = await prompter.confirm(
-          'Reset the simulated drone (wipe EEPROM) on every start? [Y/n] ',
+    if (prompter && prompter.canChooseOptions && optionItems.length > 0) {
+      // One checklist replaces the old question-by-question flow. Enter accepts
+      // the defaults; Space toggles an item; Ctrl+C cancels without changing
+      // anything.
+      if (installed) {
+        console.log('An existing simulator was found; it will be verified and reused.');
+        console.log('Use --force to download it again.');
+        console.log('');
+      }
+      const chosen = await prompter.chooseOptions(optionItems);
+      if ('vehicles' in chosen) vehicles = chosen.vehicles ? 2 : 1;
+      if ('wipe' in chosen) wipe = chosen.wipe;
+      if ('start' in chosen) startNow = chosen.start;
+      console.log(
+        `Using ${vehicles === 1 ? 'one simulated drone' : 'two simulated drones'}, ` +
+          `${wipe ? 'fresh' : 'kept'} state, ${startNow ? 'start now' : 'no autostart'}.`
+      );
+    } else {
+      if (installed) {
+        if (prompter) {
+          const reuse = await prompter.confirm(
+            'A simulator is already installed here. Verify and reuse it? [Y/n] ',
+            true
+          );
+          shouldDownload = !reuse;
+        } else if (!opts.yes) {
+          console.log('Existing simulator found; it will be verified and reused.');
+        }
+      } else if (prompter) {
+        const proceed = await prompter.confirm(
+          'Download and set up the simulator now? [Y/n] ',
           true
         );
-      } else {
-        wipe = true;
+        if (!proceed) {
+          console.log('');
+          console.log('Cancelled. Nothing was changed.');
+          prompter.close();
+          return;
+        }
       }
-    }
 
-    let startNow = !opts.noStart;
-    if (startNow && prompter && !opts.startOnly) {
-      startNow = await prompter.confirm('Start it when setup finishes? [Y/n] ', true);
+      if (vehicles === null) {
+        if (prompter) {
+          const answer = await prompter.ask('How many simulated drones? Enter 1 or 2 [1]: ', '1');
+          vehicles = answer === '2' ? 2 : 1;
+        } else {
+          vehicles = 1;
+        }
+      }
+
+      if (wipe === null) {
+        if (prompter) {
+          wipe = await prompter.confirm(
+            'Reset the simulated drone (wipe EEPROM) on every start? [Y/n] ',
+            true
+          );
+        } else {
+          wipe = true;
+        }
+      }
+
+      if (startNow && prompter) {
+        startNow = await prompter.confirm('Start it when setup finishes? [Y/n] ', true);
+      }
     }
 
     if (prompter) prompter.close();
@@ -1631,17 +1788,31 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error('');
-  console.error(`NextGCS SITL setup could not finish: ${message}`);
-  if (error instanceof InstallError && error.hints.length > 0) {
-    console.error('');
-    console.error('What to try next:');
-    for (const hint of error.hints) console.error(`  - ${hint}`);
-  } else if (!(error instanceof InstallError)) {
-    console.error('Run with --help to see the options.');
+function isDirectRun() {
+  const invoked = process.argv[1];
+  if (!invoked) return false;
+  const modulePath = fileURLToPath(import.meta.url);
+  if (path.resolve(invoked) === modulePath) return true;
+  try {
+    return realpathSync(invoked) === realpathSync(modulePath);
+  } catch {
+    return false;
   }
-  console.error('');
-  void shutdown(1);
-});
+}
+
+if (isDirectRun()) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('');
+    console.error(`NextGCS SITL setup could not finish: ${message}`);
+    if (error instanceof InstallError && error.hints.length > 0) {
+      console.error('');
+      console.error('What to try next:');
+      for (const hint of error.hints) console.error(`  - ${hint}`);
+    } else if (!(error instanceof InstallError)) {
+      console.error('Run with --help to see the options.');
+    }
+    console.error('');
+    void shutdown(1);
+  });
+}
