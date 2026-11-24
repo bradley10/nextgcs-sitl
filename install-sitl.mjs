@@ -70,8 +70,8 @@ const RUNNER_FILE = 'nextgcs-sitl.mjs';
 const MIN_NODE_MAJOR = 20;
 
 const VEHICLE_HOMES = [
-  '-35.363262,149.165237,584,353',
-  '-35.363362,149.165337,584,353',
+  '42.35894960337802,-71.0138711508416,6,353',
+  '42.35904960337802,-71.0137711508416,6,353',
 ];
 
 class InstallError extends Error {
