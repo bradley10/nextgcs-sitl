@@ -21,8 +21,25 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/bradley10/nextgcs-sitl/main/install-sitl.ps1 | iex
 ```
 
-The installer asks a couple of questions and can start the simulator
-immediately. Press Ctrl+C in that terminal to stop it.
+The installer shows one checklist with the good defaults already ticked: one
+simulated drone, reset the simulator state on every start (always fresh), and
+start it when setup finishes. Press Enter to accept them, or use the arrow
+keys and Space to change the drone count, the fresh-state setting, or
+autostart. Press Ctrl+C in that terminal to stop the simulator once it runs.
+
+To skip the checklist and choose everything up front:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bradley10/nextgcs-sitl/main/install-sitl.sh \
+  | bash -s -- --yes --vehicles 2 --no-start
+```
+
+On Windows, save the script and run it as a file to pass the same options:
+
+```powershell
+irm https://raw.githubusercontent.com/bradley10/nextgcs-sitl/main/install-sitl.ps1 -OutFile install-sitl.ps1
+powershell -ExecutionPolicy Bypass -File .\install-sitl.ps1 -Yes -Vehicles 2
+```
 
 Connect NextGCS to:
 
@@ -75,7 +92,7 @@ Run the installer or launcher with `--help` for the full list.
 
 | Option | Meaning |
 |---|---|
-| `--yes` | Accept defaults without asking |
+| `--yes` | Skip the checklist and use the defaults |
 | `--vehicles <1\|2>` | Number of simulated drones |
 | `--port <port>` | WebSocket port for the first drone (default 5765) |
 | `--wipe` / `--no-wipe` | Reset simulator state on every start (default wipe) |
