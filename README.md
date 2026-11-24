@@ -51,6 +51,22 @@ On Windows, try `127.0.0.1` first. If it does not connect, use the
 `ws://<WSL-IP>:5765` address the installer prints and allow the Windows
 Firewall prompt for WSL.
 
+## Live logs
+
+The terminal stays live while the simulator runs:
+
+- **Every simulator line.** The ArduPilot binary's stdout and stderr are
+  forwarded exactly as emitted, blank lines included (`[sitl v1] ...`).
+- **Vehicle status messages.** MAVLink status text — PreArm failures, arming,
+  mode changes, EKF events — is timestamped with its severity
+  (`[12:34:56.789] [sitl v1 msg] INFO: EKF3 IMU0 initialised`).
+- **Connections.** WebSocket open/close events show when NextGCS connects or
+  reconnects (`[12:34:56.789] [ws v1] connection opened (1 open)`).
+
+With two simulated drones, every line is tagged `v1` or `v2` so the two
+streams stay readable in one window. Nothing is written to a file; the
+simulator's own DataFlash logs remain in its state folder.
+
 ## Requirements
 
 - Node.js 20 or newer. It also runs the WebSocket bridge.

@@ -44,6 +44,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline/promises';
+import { StringDecoder } from 'node:string_decoder';
 import { ReadStream as TtyReadStream } from 'node:tty';
 import { fileURLToPath } from 'node:url';
 
@@ -95,6 +96,10 @@ Usually you do not run this file directly. Use one command:
 A run with a terminal shows one checklist (defaults already ticked); press
 Enter to accept them. Use --yes to skip it and other options to set values
 up front.
+
+While the simulator runs, this window shows its console output and MAVLink
+status messages (PreArm, arming, mode changes, EKF) live, plus NextGCS
+WebSocket connections.
 
 Options:
   -y, --yes             Skip the checklist and use the defaults
@@ -432,6 +437,112 @@ async function createPrompter() {
   }
 
   return null;
+}
+
+const STATUSTEXT_MESSAGE_ID = 253;
+export const MAVLINK_SEVERITIES = [
+  'EMERGENCY',
+  'ALERT',
+  'CRITICAL',
+  'ERROR',
+  'WARNING',
+  'NOTICE',
+  'INFO',
+  'DEBUG',
+];
+
+export function timestamp() {
+  const now = new Date();
+  const pad = (value, width) => String(value).padStart(width, '0');
+  return `${pad(now.getHours(), 2)}:${pad(now.getMinutes(), 2)}:${pad(now.getSeconds(), 2)}.${pad(
+    now.getMilliseconds(),
+    3
+  )}`;
+}
+
+/**
+ * Forward a readable stream as complete lines. Unlike a per-chunk split this
+ * keeps blank lines, never merges two lines that arrived in one chunk, and
+ * lets a multi-byte character survive a chunk boundary. Returns a flush
+ * function for a final line that arrived without a newline.
+ */
+export function forwardLines(stream, write) {
+  const decoder = new StringDecoder('utf8');
+  let pending = '';
+
+  stream.on('data', (chunk) => {
+    pending += decoder.write(chunk);
+    const lines = pending.split(/\r?\n/);
+    pending = lines.pop() ?? '';
+    for (const line of lines) write(line);
+  });
+
+  return () => {
+    pending += decoder.end();
+    if (pending.length > 0) {
+      for (const line of pending.split(/\r?\n/)) write(line);
+      pending = '';
+    }
+  };
+}
+
+/**
+ * Passive reader for MAVLink STATUSTEXT messages in a byte stream. The caller
+ * forwards the same chunks itself; this only observes them. Handles both
+ * MAVLink 1 and MAVLink 2 frames, including MAVLink 2 signing bytes.
+ */
+export function createStatustextRelay(onMessage) {
+  let pending = Buffer.alloc(0);
+
+  return {
+    push(chunk) {
+      const buffer = pending.length > 0 ? Buffer.concat([pending, chunk]) : chunk;
+      let offset = 0;
+
+      while (buffer.length - offset >= 2) {
+        const magic = buffer[offset];
+        if (magic !== 0xfd && magic !== 0xfe) {
+          offset += 1;
+          continue;
+        }
+
+        const headerLength = magic === 0xfd ? 10 : 6;
+        if (buffer.length - offset < headerLength) break;
+
+        const payloadLength = buffer[offset + 1];
+        const incompatFlags = magic === 0xfd ? buffer[offset + 2] : 0;
+        const signatureLength = magic === 0xfd && (incompatFlags & 0x01) !== 0 ? 13 : 0;
+        const frameLength = headerLength + payloadLength + 2 + signatureLength;
+        if (buffer.length - offset < frameLength) break;
+
+        const messageId =
+          magic === 0xfd
+            ? buffer[offset + 7] | (buffer[offset + 8] << 8) | (buffer[offset + 9] << 16)
+            : buffer[offset + 5];
+
+        if (messageId === STATUSTEXT_MESSAGE_ID && payloadLength >= 1) {
+          // MAVLink 2 trims trailing zero bytes, so short messages arrive with
+          // a payload smaller than the full 51-byte STATUSTEXT layout.
+          const severity = buffer[offset + headerLength];
+          const textStart = offset + headerLength + 1;
+          const textLength = Math.min(50, payloadLength - 1);
+          let text = buffer.toString('utf8', textStart, textStart + textLength);
+          const end = text.indexOf('\u0000');
+          if (end >= 0) text = text.slice(0, end);
+          text = text.trim();
+          if (text) onMessage(severity, text);
+        }
+
+        offset += frameLength;
+      }
+
+      pending = offset >= buffer.length ? Buffer.alloc(0) : Buffer.from(buffer.subarray(offset));
+    },
+  };
+}
+
+export function severityLabel(severity) {
+  return MAVLINK_SEVERITIES[severity] ?? `SEV${severity}`;
 }
 
 function armInactivityTimer(timerRef, controller, ms) {
@@ -1373,15 +1484,15 @@ async function runSitl(root, opts) {
     };
     activeVehicles.push(vehicle);
 
-    child.stdout.on('data', (chunk) => {
-      const text = chunk.toString('utf8').trim();
-      if (!text) return;
-      for (const line of text.split(/\r?\n/)) console.log(`[sitl v${sysId}] ${line}`);
-    });
-    child.stderr.on('data', (chunk) => {
-      const text = chunk.toString('utf8').trim();
-      if (!text) return;
-      for (const line of text.split(/\r?\n/)) console.error(`[sitl v${sysId} err] ${line}`);
+    const flushStdout = forwardLines(child.stdout, (line) =>
+      console.log(`[sitl v${sysId}] ${line}`)
+    );
+    const flushStderr = forwardLines(child.stderr, (line) =>
+      console.error(`[sitl v${sysId} err] ${line}`)
+    );
+    child.once('close', () => {
+      flushStdout();
+      flushStderr();
     });
     child.once('error', (error) => {
       if (!shuttingDown) {
@@ -1436,7 +1547,14 @@ async function runSitl(root, opts) {
       }
     });
 
+    const statusText = createStatustextRelay((severity, text) => {
+      console.log(
+        `${timestamp()} [sitl v${vehicle.sysId} msg] ${severityLabel(severity)}: ${text}`
+      );
+    });
+
     bridgeSocket.on('data', (chunk) => {
+      statusText.push(chunk);
       for (const client of wss.clients) {
         if (client.readyState === wsLib.WebSocket.OPEN) client.send(chunk);
       }
@@ -1452,6 +1570,18 @@ async function runSitl(root, opts) {
     });
 
     wss.on('connection', (ws) => {
+      console.log(
+        `${timestamp()} [ws v${vehicle.sysId}] connection opened (${
+          wss.clients.size
+        } open)`
+      );
+      ws.on('close', () => {
+        console.log(
+          `${timestamp()} [ws v${vehicle.sysId}] connection closed (${
+            wss.clients.size
+          } open)`
+        );
+      });
       ws.on('error', () => {
         // ignore abrupt client disconnect
       });
